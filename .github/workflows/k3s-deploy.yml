@@ -1,0 +1,165 @@
+---
+name: K3s Cluster Orchestration
+
+'on':
+  workflow_dispatch:
+    inputs:
+      playbook:
+        description: 'Playbook to execute'
+        required: true
+        type: choice
+        default: 'playbooks/site.yml'
+        options:
+          - 'playbooks/site.yml'
+          - 'playbooks/upgrade.yml'
+          - 'playbooks/reset.yml'
+          - 'playbooks/reboot.yml'
+      inventory:
+        description: 'Inventory file'
+        required: true
+        type: choice
+        default: 'rpi_inventory.yml'
+        options:
+          - 'rpi_inventory.yml'
+          - 'k3s_inventory.yml'
+          - 'inventory.yml'
+      limit:
+        description: 'Limit execution to host/group (e.g., 192.168.16.13,192.168.16.15)'
+        required: false
+        type: string
+        default: ''
+      extra_vars:
+        description: 'Extra variables (e.g., k3s_version=v1.31.0+k3s1)'
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        description: 'Dry run — check mode only, no changes applied'
+        required: false
+        type: boolean
+        default: false
+      verbose:
+        description: 'Enable verbose output (-vv)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  ANSIBLE_FORCE_COLOR: "1"
+  ANSIBLE_HOST_KEY_CHECKING: "false"
+  ANSIBLE_STDOUT_CALLBACK: "default"
+  ANSIBLE_CALLBACK_RESULT_FORMAT: "yaml"
+
+jobs:
+  k3s-orchestration:
+    name: "K3s [${{ github.event.inputs.playbook }}] — ${{ github.event.inputs.limit != '' && github.event.inputs.limit || 'All Hosts' }}"
+    runs-on: k8s-runners
+    timeout-minutes: 60
+    env:
+      PLAYBOOK: ${{ github.event.inputs.playbook }}
+      INVENTORY: ${{ github.event.inputs.inventory }}
+      LIMIT: ${{ github.event.inputs.limit }}
+      EXTRA_VARS: ${{ github.event.inputs.extra_vars }}
+      DRY_RUN: ${{ github.event.inputs.dry_run }}
+      VERBOSE: ${{ github.event.inputs.verbose }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Fetch Secrets from Infisical ────────────────────────────────────────
+      - name: Fetch common CI secrets
+        uses: Infisical/secrets-action@v1.0.9
+        with:
+          method: oidc
+          identity-id: ${{ vars.INFISICAL_IDENTITY_ID }}
+          domain: https://vault.tritec.in
+          project-slug: tritec-bh0f
+          env-slug: prod
+          secret-path: /common
+          export-type: env
+
+      # ── Setup SSH Key ──────────────────────────────────────────────────────
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "$ANSIBLE_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          echo "StrictHostKeyChecking no" >> ~/.ssh/config
+          echo "UserKnownHostsFile /dev/null" >> ~/.ssh/config
+
+      # ── Run Playbook ───────────────────────────────────────────────────────
+      - name: Run Ansible Playbook
+        run: |
+          CMD="ansible-playbook -i $INVENTORY $PLAYBOOK"
+
+          if [ -n "$LIMIT" ]; then
+            CMD="$CMD --limit $LIMIT"
+          fi
+
+          if [ -n "$EXTRA_VARS" ]; then
+            CMD="$CMD --extra-vars \"$EXTRA_VARS\""
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            CMD="$CMD --check --diff"
+            echo "⚠️  DRY RUN MODE — no changes will be applied"
+          fi
+
+          if [ "$VERBOSE" = "true" ]; then
+            CMD="$CMD -vv"
+          fi
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "▶ Playbook:  $PLAYBOOK"
+          echo "▶ Inventory: $INVENTORY"
+          echo "▶ Limit:     ${LIMIT:-All Hosts}"
+          echo "▶ Running:   $CMD"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          eval $CMD
+
+      # ── Notify Result via Telegram ─────────────────────────────────────────
+      - name: Notify result
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          if [ "$STATUS" = "success" ]; then
+            ICON="✅"
+            RESULT="Succeeded"
+          else
+            ICON="❌"
+            RESULT="Failed"
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d parse_mode="HTML" \
+            -d text="$(cat <<EOF
+          ${ICON} <b>K3s Orchestration ${RESULT}</b>
+
+          📋 <b>Workflow:</b> ${{ github.workflow }}
+          📦 <b>Repo:</b> ${{ github.repository }}
+          🌿 <b>Branch:</b> ${{ github.ref_name }}
+          📖 <b>Playbook:</b> ${PLAYBOOK}
+          📑 <b>Inventory:</b> ${INVENTORY}
+          🖥️ <b>Limit:</b> ${LIMIT:-All Hosts}
+          🔍 <b>Dry Run:</b> ${DRY_RUN}
+          ⚡ <b>Trigger:</b> ${{ github.event_name }}
+          👤 <b>Triggered by:</b> ${{ github.actor }}
+          🕐 <b>Time:</b> $(date -u '+%Y-%m-%d %H:%M UTC')
+          🔗 <b>Logs:</b> ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          )"
+
+      # ── Cleanup ────────────────────────────────────────────────────────────
+      - name: Cleanup secrets
+        if: always()
+        run: |
+          rm -f ~/.ssh/id_rsa
+          rm -f ~/.ssh/config
+          echo "✅ Secrets cleaned up"
