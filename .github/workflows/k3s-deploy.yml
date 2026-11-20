@@ -60,6 +60,10 @@ jobs:
   k3s-orchestration:
     name: "K3s [${{ github.event.inputs.playbook }}] — ${{ github.event.inputs.limit != '' && github.event.inputs.limit || 'All Hosts' }}"
     runs-on: k8s-runners
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     timeout-minutes: 60
     env:
       PLAYBOOK: ${{ github.event.inputs.playbook }}
